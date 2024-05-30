@@ -1,0 +1,211 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Step 0 - Import Libaries 
+
+```{r Libraries}
+# List of packages
+packages <- c("dplyr", "readxl", "tidyr", "ggplot2", "gridExtra", "randomForest", "gbm", "glmnet", "corrplot", "ggh4x", "lubridate", "car", "performance", "glmnet", "pls", "dbplyr", "randomForest", "odbc", "DBI", "xts", "ggfortify", "feasts", "tsibble", "e1071", "nnet", "forecast", "tidyverse", "vars", "KFAS")
+
+# Function to install and load packages
+install_and_load_packages <- function(packages) {
+      install.packages(package)
+      library(package, character.only = TRUE)
+    
+  for(package in packages) {
+    if (!require(package, character.only = TRUE)) {}
+  }
+}
+
+# Use the function to install and load packages
+install_and_load_packages(packages)
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 1 - Database Schema Connections (Editable)
+
+```{r}
+Snowflake_Connection <- DBI::dbConnect(
+  odbc::odbc(), driver = "snowflake", 
+  uid = "XXXXX", pwd = rstudioapi::askForPassword("Database password"), # change uid
+  server = "ud60298.ap-southeast-2.snowflakecomputing.com", 
+  database = "XXXXX", # change database name
+  warehouse = "XXXXX", # change warehouse name
+  schema = "XXXXX") # change schema name
+```
+
+## -----------------------------------------------------------------------------
+
+## **Repeat Step 2 and 3 for different merchants
+
+## Step 2 - Manual Data Loading (Editable)
+
+```{r eval=FALSE, include=FALSE}
+
+# Extract specific columns from the tables
+txn_table_name <-
+  tbl(Snowflake_Connection, "XXXXX") %>% # change for transaction table name
+  filter(MEMBER_FLAG == "Member", STAFF_TRANS == 0, ITEMS > 0) %>% 
+  distinct(TRANS_DATE, CUSTOMER_ID, SALES_AMOUNT, TXN_ID) %>%
+  rename(
+    SUBSCRIBERKEY = XXXXX, # change column name for Customer ID
+    CALENDARDAY = XXXXX, # change column name for Transaction Date
+    TRXN_ARTICLE_VALUE = XXXXX, # change column name for Sales Amount
+    TRXNID = XXXXX # change column name for Transaction ID
+  )
+
+join_table_name <-
+  tbl(Snowflake_Connection, "XXXXX") %>% # change for customer join date table name
+  filter(MEMBER_FLAG == "Member", STAFF_TRANS == 0, ITEMS > 0) %>% 
+  distinct(CUSTOMER_ID, JOINED_DATE) %>%
+  rename(
+    SUBSCRIBERKEY = CUSTOMER_ID, # change column name
+    JOIN_DATE = JOINED_DATE # change column name
+  )
+```
+
+## Step 3 - Calculate metrics 
+
+```{r}
+# Extract unique SUBSCRIBERKEYs and their associated YYYYMM without collecting
+customer_by_month <- txn_table_name %>%
+  mutate(
+    YYYYMM = paste0(substr(CALENDARDAY, 1, 4), substr(CALENDARDAY, 6, 7)),
+    YMD = as.Date(paste0(substr(YYYYMM, 1, 4), "-", substr(YYYYMM, 5, 6), "-01"))) %>%
+  select(SUBSCRIBERKEY, YYYYMM, YMD) %>%
+  distinct()
+
+# Load JOIN_DATE data, convert JOIN_DATE to YYYYMM without collecting
+join_date_by_customer <- join_table_name %>%
+  mutate(JOIN_YYYYMM = paste0(substr(JOIN_DATE, 1, 4), substr(JOIN_DATE, 6, 7))) %>%
+  select(SUBSCRIBERKEY, JOIN_YYYYMM)
+
+
+
+# Total Sales, Total Customer, Total Transactions, ATV, AS, ATF
+# Calculate basic metrics without collecting into memory
+snowflake_table <- txn_table_name %>%
+  mutate(YYYYMM = paste0(substr(CALENDARDAY, 1, 4), substr(CALENDARDAY, 6, 7))) %>%
+  group_by(YYYYMM) %>%
+  summarise(
+    Total_Sales = sum(TRXN_ARTICLE_VALUE),
+    Total_Customer = n_distinct(SUBSCRIBERKEY),
+    Total_Transactions = n_distinct(TRXNID)
+  ) %>%
+  mutate(
+    ATV = Total_Sales / Total_Transactions,
+    AS = Total_Sales / Total_Customer,
+    ATF = Total_Transactions / Total_Customer
+  )
+
+
+
+# New Customer Rate
+# Join the transactions table with the join date table to determine new customers
+new_customer_rate_calculation <- customer_by_month %>%
+  left_join(join_date_by_customer, by = "SUBSCRIBERKEY") %>%
+  mutate(Is_New_Customer = if_else(JOIN_YYYYMM == YYYYMM, TRUE, FALSE)) %>%
+  group_by(YYYYMM) %>%
+  summarise(
+    New_Customers = sum(as.integer(Is_New_Customer)),
+    Total_Customers = n_distinct(SUBSCRIBERKEY)
+  ) %>%
+  mutate(New_Customer_Rate = New_Customers / Total_Customers) %>% 
+  arrange(YYYYMM)
+
+
+
+# Reactivated Rate
+# Calculate gaps in activity and flag reactivations
+# This operation is complex and may require raw SQL or more advanced dplyr operations
+reactivated_customers <- customer_by_month %>%
+  window_order(SUBSCRIBERKEY, YYYYMM) %>%
+  group_by(SUBSCRIBERKEY) %>%
+  mutate(
+    Prev_YYYYMM = lag(YMD),
+    Month_Gap = datediff('month',Prev_YYYYMM, YMD),
+    # Month_Gap = month(YMD) - month(Prev_YYYYMM) - 1, # This is conceptual; actual calculation may vary
+    Reactivated = if_else(Month_Gap >= 1, TRUE, FALSE)
+  ) %>% 
+  filter(Reactivated) %>%
+  ungroup() %>%
+  distinct(SUBSCRIBERKEY, YYYYMM) 
+
+# Step 3: Calculate the reactivated rate by month
+# Join with the main transaction table to calculate rates
+reactivated_rate_by_month <- reactivated_customers %>%
+  group_by(YYYYMM) %>%
+  summarise(Reactivated_Customers = n()) %>%
+  left_join(snowflake_table %>% select(YYYYMM, Total_Customer), by = "YYYYMM") %>%
+  mutate(Reactivated_Rate = Reactivated_Customers / Total_Customer)
+
+
+
+# Retention Rate
+# Add columns for retention rates
+snowflake_table$Retention_Rate <- NA
+
+# Step 1: Extract unique SUBSCRIBERKEYs and their associated YYYYMM, correctly converting YYYYMM to a date
+activity_summary <- txn_table_name %>%
+  mutate(
+    YYYYMM = paste0(substr(CALENDARDAY, 1, 4), "-", substr(CALENDARDAY, 6, 7)),  # Correct the substring indices if needed
+    YYYYMM_date = as.Date(paste0(substr(YYYYMM, 1, 4), "-", substr(YYYYMM, 6, 7), "-01"))
+  ) %>%
+  select(SUBSCRIBERKEY, YYYYMM, YYYYMM_date) %>%
+  distinct()
+
+# Step 2: Identify retained customers by checking if they were active in consecutive months
+activity_with_prev_month <- activity_summary %>%
+  arrange(SUBSCRIBERKEY, YYYYMM_date) %>%
+  group_by(SUBSCRIBERKEY) %>%
+  mutate(Prev_YYYYMM_date = lag(YYYYMM_date)) %>%
+  ungroup()
+
+retained_customers <- activity_with_prev_month %>%
+  filter(YYYYMM_date == Prev_YYYYMM_date + months(1)) %>%
+  count(YYYYMM, name = "Retained_Customers")
+
+# Step 3: Calculate total unique customers for each month
+total_customers_by_month <- activity_summary %>%
+  group_by(YYYYMM) %>%
+  summarise(Total_Customers = n_distinct(SUBSCRIBERKEY), .groups = 'drop')
+
+# Step 4: Calculate the retention rate by month
+retention_rate_by_month <- retained_customers %>%
+  left_join(total_customers_by_month, by = "YYYYMM") %>%
+  mutate(
+    Retention_Rate = Retained_Customers / lag(Total_Customers, order_by = YYYYMM),
+    YYYYMM = paste0(substr(YYYYMM, 1, 4), substr(YYYYMM, 6, 7))
+  )
+
+
+# Join the 3 rates back to the main transaction metrics table
+snowflake_table <- snowflake_table %>%
+  left_join(new_customer_rate_calculation %>% select(YYYYMM, New_Customer_Rate), by = "YYYYMM") %>%
+  left_join(reactivated_rate_by_month %>% select(YYYYMM, Reactivated_Rate), by = "YYYYMM") %>% 
+  left_join(retention_rate_by_month %>% select(YYYYMM, Retention_Rate), by = "YYYYMM") %>%
+  arrange(YYYYMM)
+
+
+# View the structure of the updated table (without collecting)
+print(snowflake_table)
+```
+
+## -----------------------------------------------------------------------------
+
+# Step 4 - Export the data as a RDS file (Editable)
+
+```{r}
+# Collect the results into a local data frame
+snowflake_table_local <- collect(snowflake_table)
+
+# View the collected data
+print(snowflake_table_local)
+
+saveRDS(snowflake_table_local, file = "Lift Prediction Models/RENAME_THIS_local.rds") # change file address
+
+```

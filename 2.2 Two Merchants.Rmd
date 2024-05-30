@@ -1,0 +1,337 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Step 0 - Import Libaries
+
+```{r Libraries}
+# List of packages
+packages <- c("dplyr", "readxl", "tidyr", "ggplot2", "gridExtra", "randomForest", "gbm", "glmnet", "corrplot", "ggh4x", "lubridate", "car", "performance", "glmnet", "pls", "dbplyr", "randomForest", "odbc", "DBI", "xts", "ggfortify", "feasts", "tsibble", "e1071", "nnet", "forecast", "tidyverse", "vars", "KFAS", "qqplotr", "Metrics")
+
+# Function to install and load packages
+install_and_load_packages <- function(packages) {
+  for(package in packages) {
+    if (!require(package, character.only = TRUE)) {
+      install.packages(package)
+      library(package, character.only = TRUE)
+    }
+  }
+}
+
+# Use the function to install and load packages
+install_and_load_packages(packages)
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 1 - Load Two RDS Files for Different Merchants (Editable)
+
+```{r}
+# click on "RENAME_THIS_local.rds" to load the RDS file
+
+data_1 <- get("XXXXX_local") # change it to the first merchant RDS file name
+data_1$Merchant <- "Merchant A"  # change it to the first merchant name
+
+data_2 <- get("XXXXX_local") # change it to the second merchant RDS file name
+data_2$Merchant <- "Merchant B"  # change it to the second merchant name
+
+# Combine the two data frames by stacking rows
+combined_data <- bind_rows(data_1, data_2)
+```
+
+## -----------------------------------------------------------------------------
+
+## **Run either one for Step 2
+
+## Step 2.1 - Scaling absolute values and omiting NA for numeric columns
+
+```{r}
+## cleaned from NA values (DO NOT RUN if the model_data have non-numeric values)
+# model_data_clean <- na.omit(model_data) %>% select(!YYYYMM) %>% scale() %>% as.data.frame()
+
+# Remove NA values and drop the YYYYMM column if it's not needed for modeling
+model_data_clean <- combined_data %>%
+  na.omit() %>%
+  dplyr::select(-YYYYMM) 
+
+# Scale only numeric columns
+# Identify numeric columns
+numeric_columns <- sapply(model_data_clean, is.numeric)
+
+# Apply scaling to numeric columns only
+model_data_clean[numeric_columns] <- scale(model_data_clean[numeric_columns])
+
+# Convert back to a data frame if it was converted to a matrix by scale()
+model_data_clean <- as.data.frame(model_data_clean)
+
+```
+
+## Step 2.2 - Calculate Lift and omit NA for numeric columns
+
+```{r}
+model_data_clean <- combined_data %>%
+  group_by(Merchant) %>% 
+  mutate(across(where(is.numeric), ~ifelse(lag(.x) == 0 | is.na(lag(.x)), NA, .x / lag(.x) - 1))) %>%
+  ungroup()
+
+model_data_clean <- na.omit(model_data_clean)
+
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 3 - Prepare Shuffled Training and Test Sets Based on Merchant Category
+
+```{r}
+## First, separate the data by Merchant category
+dataset_1_data <- filter(model_data_clean, Merchant == "Merchant A")  # change it to the first merchant name
+dataset_2_data <- filter(model_data_clean, Merchant == "Merchant B")  # change it to the second merchant name
+
+## For the first merchant, take 75% as training data
+set.seed(1234)  # Ensure reproducibility
+dataset_1_train_indices <- sample(seq_len(nrow(dataset_1_data)), size = floor(0.75 * nrow(dataset_1_data)))
+dataset_1_test <- dataset_1_data[dataset_1_train_indices, ]
+
+## For the second merchant, take 25% as test data
+set.seed(1234)  # Ensure reproducibility
+dataset_2_test_indices <- sample(seq_len(nrow(dataset_2_data)), size = floor(0.25 * nrow(dataset_2_data)))
+dataset_2_test <- dataset_2_data[dataset_2_test_indices, ]
+
+## Prepare the combined test set which consists of 25% of the second merchant
+test <- dataset_2_test
+
+## The training set consists of 75% of the first merchant
+train <- dataset_1_test
+
+## Print out the number of observations in train and test sets to confirm
+print(paste("Number of rows in training set:", nrow(train)))
+print(paste("Number of rows in testing set:", nrow(test)))
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 4.1 - OLS
+
+```{r}
+# Fit the linear regression model using the training set, including all metrics
+lm_model_train <- lm(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                       New_Customer_Rate + Reactivated_Rate + Retention_Rate, 
+                     data = train)
+
+# Display the summary of the model
+summary(lm_model_train)
+
+# Use the model to make predictions on the test set
+predictions <- predict(lm_model_train, newdata = test)
+
+# Add the predictions to the test dataframe
+test$Predicted_Sales <- predictions
+
+# Perform model diagnostics using check_model()
+check_results <- check_model(lm_model_train)
+
+# Display the results
+print(check_results)
+
+# Calculate RMSE
+rmse_test <- sqrt(mean((test$Total_Sales - test$Predicted_Sales)^2))
+print(paste("RMSE on Test Set:", rmse_test))
+
+# Calculate MAE
+mae_test <- mean(abs(test$Total_Sales - test$Predicted_Sales))
+print(paste("MAE on Test Set:", mae_test))
+
+# Calculate R-squared on Test Set
+ss_total <- sum((test$Total_Sales - mean(test$Total_Sales))^2)
+ss_res <- sum((test$Total_Sales - test$Predicted_Sales)^2)
+r_squared_test <- 1 - (ss_res / ss_total)
+print(paste("R-squared on Test Set:", r_squared_test))
+
+
+# fail to reject the null hypothesis that the residuals are normally distributed.
+check_normality(lm_model_train)
+x <- check_normality(lm_model_train)
+plot(x)
+
+# Plot
+check_predictions(lm_model_train)
+
+
+```
+
+## Step 4.2 - Prepare data for Ridge and LASSO Regression
+
+```{r}
+# For the training set
+x_train <- model.matrix(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                          New_Customer_Rate + Reactivated_Rate + Retention_Rate - 1, 
+                        data = train)
+
+y_train <- train$Total_Sales
+
+# For the test set
+x_test <- model.matrix(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                         New_Customer_Rate + Reactivated_Rate + Retention_Rate - 1, 
+                       data = test)
+
+y_test <- test$Total_Sales
+```
+
+## Step 4.3 - Ridge Regression
+
+```{r}
+# Perform cross-validation for Ridge Regression on the training data
+cv_fit_ridge <- cv.glmnet(x_train, y_train, alpha = 0)
+
+# Get the optimal lambda for Ridge from the training data
+lambda_min_ridge <- cv_fit_ridge$lambda.min
+
+# Refit the Ridge Regression model using the optimal lambda on the training data
+model_ridge <- glmnet(x_train, y_train, alpha = 0, lambda = lambda_min_ridge)
+
+# Use the fitted Ridge model to make predictions on the test set
+predictions_ridge <- predict(model_ridge, s = lambda_min_ridge, newx = x_test)
+
+# Calculate RMSE for Ridge Regression on the test data
+rmse_ridge <- sqrt(mean((y_test - predictions_ridge)^2))
+print(paste("Ridge Regression RMSE on Test Set:", rmse_ridge))
+
+# Calculate MAE for Ridge Regression on the test data
+mae_ridge <- mean(abs(y_test - predictions_ridge))
+print(paste("Ridge Regression MAE on Test Set:", mae_ridge))
+
+# Calculate R-squared for Ridge Regression on the test data
+ss_total_ridge <- sum((y_test - mean(y_test))^2)
+ss_res_ridge <- sum((y_test - predictions_ridge)^2)
+r_squared_ridge <- 1 - (ss_res_ridge / ss_total_ridge)
+print(paste("Ridge Regression R-squared on Test Set:", r_squared_ridge))
+```
+
+## Step 4.4 - LASSO Regression
+
+```{r}
+# Perform cross-validation for Lasso Regression on the training data
+cv_fit_lasso <- cv.glmnet(x_train, y_train, alpha = 1)
+
+# Get the optimal lambda for Lasso from the training data
+lambda_min_lasso <- cv_fit_lasso$lambda.min
+
+# Refit the Lasso Regression model using the optimal lambda on the training data
+model_lasso <- glmnet(x_train, y_train, alpha = 1, lambda = lambda_min_lasso)
+
+# Use the fitted Lasso model to make predictions on the test set
+predictions_lasso <- predict(model_lasso, s = lambda_min_lasso, newx = x_test)
+
+# Calculate RMSE for Lasso Regression on the test data
+rmse_lasso <- sqrt(mean((y_test - predictions_lasso)^2))
+print(paste("Lasso Regression RMSE on Test Set:", rmse_lasso))
+
+
+
+# Check Non-zero Coefficients Chosen by Lasso
+# Extract coefficients at the optimal lambda for the Lasso model
+lasso_coefficients <- coef(model_lasso, s = lambda_min_lasso)
+
+# Convert to a more readable format, removing zero coefficients
+non_zero_coefficients <- lasso_coefficients[lasso_coefficients[,1] != 0, , drop = FALSE]
+
+# Print non-zero coefficients
+print("Non-zero Coefficients Chosen by Lasso:")
+print(non_zero_coefficients)
+
+
+# Calculate RMSE for Lasso Regression on the test data
+rmse_lasso <- sqrt(mean((y_test - predictions_lasso)^2))
+print(paste("Lasso Regression RMSE on Test Set:", rmse_lasso))
+
+# Calculate MAE for Lasso Regression on the test data
+mae_lasso <- mean(abs(y_test - predictions_lasso))
+print(paste("Lasso Regression MAE on Test Set:", mae_lasso))
+
+# Calculate R-squared for Lasso Regression on the test data
+ss_total_lasso <- sum((y_test - mean(y_test))^2)
+ss_res_lasso <- sum((y_test - predictions_lasso)^2)
+r_squared_lasso <- 1 - (ss_res_lasso / ss_total_lasso)
+print(paste("Lasso Regression R-squared on Test Set:", r_squared_lasso))
+```
+
+## Step 4.5 - Random Forest
+
+```{r}
+# Fit Random Forest regression model
+rf_model <- randomForest(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                           New_Customer_Rate + Reactivated_Rate + Retention_Rate, 
+                         data = train, importance = TRUE)
+
+# Print the model summary
+print(rf_model)
+
+# Check variable importance
+importance(rf_model)
+
+# Use the fitted model to make predictions on the test set
+predictions_rf <- predict(rf_model, newdata = test)
+
+# Calculate RMSE for Random Forest Regression on the test data
+rmse_rf <- sqrt(mean((test$Total_Sales - predictions_rf)^2))
+print(paste("Random Forest Regression RMSE on Test Set:", rmse_rf))
+
+# Calculate MAE for Random Forest Regression on the test data
+mae_rf <- mean(abs(test$Total_Sales - predictions_rf))
+print(paste("Random Forest Regression MAE on Test Set:", mae_rf))
+
+# Calculate R-squared for Random Forest Regression on the test data
+ss_total_rf <- sum((test$Total_Sales - mean(test$Total_Sales))^2)
+ss_res_rf <- sum((test$Total_Sales - predictions_rf)^2)
+r_squared_rf <- 1 - (ss_res_rf / ss_total_rf)
+print(paste("Random Forest Regression R-squared on Test Set:", r_squared_rf))
+```
+
+## Step 4.6 - Neural Networks
+
+```{r}
+# For capturing complex nonlinear patterns in the data
+# Fit a neural network model
+nn_model <- nnet(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                 New_Customer_Rate + Reactivated_Rate + Retention_Rate,
+                 data = train,
+                 size = 15,               # Increased number of units in the hidden layer
+                 linout = TRUE,           # Linear output neurons
+                 decay = 0.01,            # Adding weight decay to prevent overfitting
+                 maxit = 500)             # Increased max iterations for more training
+
+
+# Predict on the test set
+predictions_nn <- predict(nn_model, newdata = test, type = "raw")
+
+# Predict on the training set
+train_predictions_nn_complex <- predict(nn_model, newdata = train, type = "raw")
+
+# Calculate RMSE on the training set
+rmse_nn_train_complex <- sqrt(mean((train$Total_Sales - train_predictions_nn_complex)^2))
+print(paste("Neural Network RMSE on Training Set:", rmse_nn_train_complex))
+
+# Calculate RMSE
+rmse_nn <- sqrt(mean((test$Total_Sales - predictions_nn)^2))
+print(paste("Neural Network RMSE on Test Set:", rmse_nn))
+
+# Calculate Mean Absolute Error (MAE) on the test set
+mae_nn_test <- mean(abs(test$Total_Sales - predictions_nn))
+print(paste("Neural Network MAE on Test Set:", mae_nn_test))
+
+# Calculate R-squared for training data
+ss_total_train <- sum((train$Total_Sales - mean(train$Total_Sales))^2)
+ss_res_train <- sum((train$Total_Sales - train_predictions_nn_complex)^2)
+r_squared_train_nn <- 1 - (ss_res_train / ss_total_train)
+print(paste("Neural Network R-squared on Training Set:", r_squared_train_nn))
+
+# Calculate R-squared for test data
+ss_total_test <- sum((test$Total_Sales - mean(test$Total_Sales))^2)
+ss_res_test <- sum((test$Total_Sales - predictions_nn)^2)
+r_squared_test_nn <- 1 - (ss_res_test / ss_total_test)
+print(paste("Neural Network R-squared on Test Set:", r_squared_test_nn))
+
+
+```

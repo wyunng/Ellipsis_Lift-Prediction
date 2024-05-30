@@ -1,0 +1,667 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Step 0 - Import Libaries
+
+```{r Libraries}
+# List of packages
+packages <- c("dplyr", "readxl", "tidyr", "ggplot2", "gridExtra", "randomForest", "gbm", "glmnet", "corrplot", "ggh4x", "lubridate", "car", "performance", "glmnet", "pls", "dbplyr", "randomForest", "odbc", "DBI", "xts", "ggfortify", "feasts", "tsibble", "e1071", "nnet", "forecast", "tidyverse", "vars", "KFAS")
+
+# Function to install and load packages
+install_and_load_packages <- function(packages) {
+  for(package in packages) {
+    if (!require(package, character.only = TRUE)) {
+      install.packages(package)
+      library(package, character.only = TRUE)
+    }
+  }
+}
+
+# Use the function to install and load packages
+install_and_load_packages(packages)
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 1 - Load a single RDS file
+
+```{r}
+# click on "RENAME_THIS_local.rds" to load the RDS file
+model_data <- MJB_local # change it to your RDS file name
+
+combined_data <- model_data
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 2.1 - Visualization Plots (for a single merchant)
+
+```{r}
+model_data <- model_data %>%
+  arrange(YYYYMM) %>%
+  mutate(row = row_number())  # Add a row number to identify first and last
+
+# Identify the first and last YYYYMM
+first_YYYYMM <- model_data %>% slice(1) %>% pull(YYYYMM)
+last_YYYYMM <- model_data %>% slice(n()) %>% pull(YYYYMM)
+
+# Drop the first and last observations
+model_data <- model_data %>%
+  filter(!(YYYYMM %in% c(first_YYYYMM, last_YYYYMM)))
+
+
+
+# Line Plot
+ggplot(model_data, aes(x = YYYYMM, y = Total_Sales)) +
+    geom_line(group=1) +  # Ensure that all data points are connected in a single line.
+    labs(title = "Total Sales Over Time", x = "Year-Month (YYYYMM)", y = "Total Sales") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+
+# Adding 'Year' and 'Month' columns to the dataframe
+model_data <- model_data %>%
+  mutate(
+    Year = substr(YYYYMM, 1, 4),  # Extract the first four characters as year
+    Month = substr(YYYYMM, 5, 6)  # Extract the last two characters as month
+  )
+
+
+
+# Season Plot
+ggplot(model_data, aes(x = Month, y = Total_Sales, group = Year, color = Year)) +
+  geom_line() +
+  geom_point() +  # Optional, to highlight data points
+  scale_x_discrete(limits = c("01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"),
+  labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")) +
+  theme_minimal() +
+  labs(title = "Seasonal Plot of Total Sales by Year",
+       x = "Month",
+       y = "Total Sales",
+       color = "Year") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))  
+
+
+
+# Seasonal Subseries Plot
+# Ensure the data is ordered by year and month for plotting consistency
+model_data <- model_data %>%
+  arrange(Year, Month)
+
+# Calculate the average sales for each month
+monthly_averages <- model_data %>%
+  group_by(Month) %>%
+  summarize(Average_Sales = mean(Total_Sales))
+
+# Join this average back to the original dataset for plotting
+model_data <- model_data %>%
+  left_join(monthly_averages, by = "Month")
+
+# Creating the Seasonal Subseries Plot with average lines
+ggplot(model_data, aes(x = Year, y = Total_Sales)) +
+  geom_line(aes(group = Month, color = Month)) +
+  geom_point(aes(color = Month)) +  # Optionally add points
+  geom_hline(data = monthly_averages, aes(yintercept = Average_Sales), color = "blue", size = 0.5) +
+  facet_grid(~Month, scales = "fixed") +  # Facet by month
+  labs(title = "Seasonal Subseries Plot of Total Sales",
+       x = "Year",
+       y = "Total Sales") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis labels
+        legend.position = "none")  # Remove the legend
+```
+
+## Step 2.2 - Visualization Plots (averaging skewed months)
+
+```{r}
+# Split the dataset
+test_data <- model_data %>%
+  filter(!(YYYYMM %in% c("202105", "202106", "202107", "202108", "202109", "202110", "202111")))
+
+
+training_data <- model_data %>% 
+  filter(!(YYYYMM >= "202105" & YYYYMM <= "202111"))
+
+# Fit the OLS model
+ols_model <- lm(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                New_Customer_Rate + Reactivated_Rate + Retention_Rate, 
+                data = training_data)
+
+# Display the summary of the model
+summary(ols_model)
+
+# Predicting total sales for the test data
+test_data$Predicted_Sales <- predict(ols_model, newdata = test_data)
+
+# Display the test data with predictions
+test_data
+
+# Calculate RMSE
+rmse <- sqrt(mean((test_data$Total_Sales - test_data$Predicted_Sales)^2))
+print(paste("RMSE on Test Set:", rmse))
+
+# Calculate MAE
+mae <- mean(abs(test_data$Total_Sales - test_data$Predicted_Sales))
+print(paste("MAE on Test Set:", mae))
+
+# Calculate R-squared
+ss_total <- sum((test_data$Total_Sales - mean(test_data$Total_Sales))^2)
+ss_res <- sum((test_data$Total_Sales - test_data$Predicted_Sales)^2)
+r_squared <- 1 - (ss_res / ss_total)
+print(paste("R-squared on Test Set:", r_squared))
+
+
+
+# Naive Prediction for Covid - Plot
+pre_covid_data <- model_data %>%
+  filter(YYYYMM < "202105") %>%
+  mutate(Predicted_Sales = Total_Sales)
+
+post_covid_data <- model_data %>%
+  filter(YYYYMM > "202111") %>%
+  mutate(Predicted_Sales = Total_Sales)
+
+# Data during the specified period
+covid_period_data <- model_data %>%
+  filter(YYYYMM >= "202105" & YYYYMM <= "202111")
+
+# Calculate start and end points for the naive prediction
+start_point <- tail(pre_covid_data$Total_Sales, n = 1)
+end_point <- head(post_covid_data$Total_Sales, n = 1)
+
+# Create a sequence for the prediction
+predicted_sequence <- seq(from = start_point, to = end_point, length.out = nrow(covid_period_data))
+
+# Add the predicted sequence to the covid_period_data
+covid_period_data$Predicted_Sales <- predicted_sequence
+
+# Combine the datasets
+full_data_with_prediction <- bind_rows(
+  pre_covid_data,
+  covid_period_data,
+  post_covid_data
+)
+
+
+
+# Line Plot (Naive)
+ggplot(full_data_with_prediction, aes(x = YYYYMM, y = Predicted_Sales)) +
+    geom_line(group=1) +  # Ensure that all data points are connected in a single line.
+    labs(title = "Total Sales Over Time", x = "Year-Month (YYYYMM)", y = "Observed and Naive Predicted Sales (202105-202111)") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+
+# Season Plot (Naive)
+ggplot(full_data_with_prediction, aes(x = Month, y = Predicted_Sales, group = Year, color = Year)) +
+  geom_line() +
+  geom_point() +
+  scale_x_discrete(limits = c("01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"),
+                   labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")) +
+  theme_minimal() +
+  labs(title = "Seasonal Plot of Total Sales by Year (Naive)",
+       x = "Month",
+       y = "Total Sales",
+       color = "Year") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels for better readability
+
+
+
+# Seasonal Subseries Plot (Naive)
+# Ensure the data is ordered by year and month for plotting consistency
+full_data_with_prediction <- full_data_with_prediction %>%
+  arrange(Year, Month)
+
+# Calculate the average sales for each month
+monthly_averages <- full_data_with_prediction %>%
+  group_by(Month) %>%
+  summarize(Average_Sales = mean(Predicted_Sales))
+
+# Join this average back to the original dataset for plotting
+full_data_with_prediction <- full_data_with_prediction %>%
+  left_join(monthly_averages, by = "Month")
+
+# Creating the Seasonal Subseries Plot with average lines
+ggplot(full_data_with_prediction, aes(x = Year, y = Predicted_Sales)) +
+  geom_line(aes(group = Month, color = Month)) +
+  geom_point(aes(color = Month)) +  # Optionally add points
+  geom_hline(data = monthly_averages, aes(yintercept = Average_Sales), color = "blue", size = 0.5) +
+  facet_grid(~Month, scales = "fixed") +  # Facet by month
+  labs(title = "Seasonal Subseries Plot of Total Sales (Naive)",
+       x = "Year",
+       y = "Total Sales") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis labels
+        legend.position = "none")  # Remove the legend
+
+```
+
+## Step 2.3 - SARIMA Lift Prediction
+
+```{r}
+filtered_data <- full_data_with_prediction %>%
+  filter(!(YYYYMM >= "201910" & YYYYMM <= "202109")) %>%  
+  filter(!(YYYYMM < "201709")) %>%
+  filter(!(YYYYMM > "202309")) %>%
+  filter((YYYYMM != "201712")) %>%
+  filter((YYYYMM != "201812")) %>%
+#  filter(!(YYYYMM  "202112")) %>%
+#  filter(!(YYYYMM  "202212"))
+
+# Line Plot
+ggplot(filtered_data, aes(x = YYYYMM, y = Predicted_Sales)) +
+    geom_line(group=1) +  # Ensure that all data points are connected in a single line.
+    labs(title = "Total Sales Over Time", x = "Year-Month (YYYYMM)", y = "Total Sales") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+
+# Calculate lift
+lift_data <- filtered_data %>%
+  arrange(YYYYMM) %>%
+  mutate(Lift = (Predicted_Sales / lag(Predicted_Sales) - 1) * 100)  # Lift percentage change
+
+# Removing the first row since it will have NA for the lift
+lift_data <- lift_data %>%
+  filter(!is.na(Lift))
+
+
+# Plot the lift
+ggplot(lift_data, aes(x = YYYYMM, y = Lift)) +
+  geom_line(group = 1, color = "blue") +
+  geom_point(color = "red") +  # Adding points to highlight each month's lift
+  labs(title = "Monthly Lift in Predicted Sales", x = "Year-Month (YYYYMM)", y = "Lift (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))  # Improve readability of x-axis labels
+
+
+# Splitting the data into sections based on year range
+training_lift <- lift_data %>% filter(between(YYYYMM, "201710", "202210"))
+validate_lift <- lift_data %>% filter(between(YYYYMM, "202210", "202309"))
+
+
+training_ts <- ts(training_lift$Lift, frequency = 12)  # Monthly data, adjust frequency accordingly
+
+
+# SARIMA model
+sarima_model <- auto.arima(training_ts, seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+
+# Forecasting
+future_months <- 12 # Define number of months for forecasting
+forecast_sarima <- forecast(sarima_model, h = future_months)
+
+# Create date sequence for the forecast period
+start_date <- as.Date(paste0(substr(max(training_lift$YYYYMM), 1, 4), "-", substr(max(training_lift$YYYYMM), 5, 6), "-01"))
+date_seq <- seq(from = start_date, by = "month", length.out = future_months + 1)[-1]  # Skip the first to align with forecast periods
+
+
+# Creating a data frame from the forecast
+forecast_df <- data.frame(
+  YYYYMM = format(date_seq, "%Y%m"),
+  Lift = forecast_sarima$mean,
+  Lower = forecast_sarima$lower[, "80%"],
+  Upper = forecast_sarima$upper[, "80%"],
+  Group = "Forecast"
+)
+
+
+# Convert the training_lift to include YYYYMM for continuity
+training_df <- lift_data %>%
+  mutate(Group = "Actual")
+
+# Combine actual data and forecast data
+combined_lift_plot_data <- bind_rows(training_df, forecast_df)
+
+# Prepare dates for plotting
+combined_lift_plot_data$Date <- as.Date(paste0(substr(combined_lift_plot_data$YYYYMM, 1, 4), "-", substr(combined_lift_plot_data$YYYYMM, 5, 6), "-01"))
+forecast_df$Date <- as.Date(paste0(substr(forecast_df$YYYYMM, 1, 4), "-", substr(forecast_df$YYYYMM, 5, 6), "-01"))
+
+# Plot with geom_line and geom_ribbon
+ggplot() +
+  geom_line(data = filter(combined_lift_plot_data, Group == "Actual"), aes(x = Date, y = Lift, colour = "Actual Lift")) +
+  geom_ribbon(data = forecast_df, aes(x = Date, ymin = Lower, ymax = Upper), fill = "red", alpha = 0.2) +
+  geom_line(data = forecast_df, aes(x = Date, y = Lift, colour = "Forecasted Lift")) +
+  scale_color_manual(values = c("Actual Lift" = "blue", "Forecasted Lift" = "red")) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  labs(title = "SARIMA Forecast of Monthly Lift",
+       x = "Date", 
+       y = "Lift (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        legend.position = "bottom")
+
+
+# Prophet Model
+
+# Prepare data for Prophet
+df_prophet <- training_lift %>%
+  mutate(ds = as.Date(paste0(substr(YYYYMM, 1, 4), "-", substr(YYYYMM, 5, 6), "-01")),
+         y = Lift)
+
+
+# Fit the Prophet model
+m <- prophet(df_prophet)
+
+# Make a dataframe for future predictions
+future_months <- 12  # Define how many months to forecast
+future <- make_future_dataframe(m, periods = future_months, freq = "month")
+
+# Predict future values
+forecast_prophet <- predict(m, future)
+
+# Plot the forecast
+plot(m, forecast_prophet)
+
+# Plot the components of the forecast
+prophet_plot_components(m, forecast_prophet)
+
+
+
+# Convert 'ds' in forecast data to Date if not already
+forecast_plot_data <- forecast_plot_data %>%
+  mutate(ds = as.Date(ds))
+
+# Assuming 'Date' in combined_lift_plot_data is already in Date format, otherwise convert it
+combined_lift_plot_data <- combined_lift_plot_data %>%
+  mutate(Date = as.Date(Date))
+
+# Now, plotting the combined data with corrected Date formats
+combined_plot <- ggplot() +
+  geom_line(data = filter(combined_lift_plot_data, Group == "Actual"), aes(x = Date, y = Lift, colour = "Actual Lift")) +
+  geom_line(data = forecast_plot_data, aes(x = ds, y = yhat, colour = "Forecasted Lift")) +
+  geom_ribbon(data = forecast_plot_data, aes(x = ds, ymin = yhat_lower, ymax = yhat_upper), fill = "red", alpha = 0.2) +
+  scale_color_manual(values = c("Actual Lift" = "blue", "Forecasted Lift" = "red")) +
+  labs(title = "Forecast vs Actual Sales Lift",
+       x = "Date", 
+       y = "Lift") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        legend.position = "bottom")
+
+# Print the plot
+print(combined_plot)
+```
+
+## -----------------------------------------------------------------------------
+
+## **Run either one for Step 3
+
+## Step 3.1 - Scaling absolute values and omiting NA for numeric columns
+
+```{r}
+## cleaned from NA values (DO NOT RUN if the model_data have non-numeric values)
+# model_data_clean <- na.omit(model_data) %>% select(!YYYYMM) %>% scale() %>% as.data.frame()
+
+# Remove NA values and drop the YYYYMM column if it's not needed for modeling
+model_data_clean <- combined_data %>%
+  na.omit() %>%
+  dplyr::select(-YYYYMM) 
+
+# Scale only numeric columns
+# Identify numeric columns
+numeric_columns <- sapply(model_data_clean, is.numeric)
+
+# Apply scaling to numeric columns only
+model_data_clean[numeric_columns] <- scale(model_data_clean[numeric_columns])
+
+# Convert back to a data frame if it was converted to a matrix by scale()
+model_data_clean <- as.data.frame(model_data_clean)
+```
+
+## Step 3.2 - Calculate Lift and omit NA for numeric columns
+
+```{r}
+model_data_clean <- combined_data %>%
+  #group_by(Merchant) %>% # for dataset with two merchants 
+  mutate(across(where(is.numeric), ~ifelse(lag(.x) == 0 | is.na(lag(.x)), NA, .x / lag(.x) - 1))) %>%
+  ungroup()
+
+model_data_clean <- na.omit(model_data_clean)
+
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 4 - Prepare Shuffled Training and Test Sets
+
+```{r}
+## 75% of the sample size
+smp_size <- floor(0.75 * nrow(model_data_clean))
+
+## set the seed to make your partition reproducible
+set.seed(1234)
+train_ind <- sample(seq_len(nrow(model_data_clean)), size = smp_size)
+
+train <- model_data_clean[train_ind, ]
+test <- model_data_clean[-train_ind, ]
+```
+
+## -----------------------------------------------------------------------------
+
+## Step 5.1 - OLS Model
+
+```{r}
+# Fit the linear regression model using the training set
+lm_model_train <- lm(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF +
+                       New_Customer_Rate + Reactivated_Rate + Retention_Rate, 
+                     data = train)
+
+# Display the summary of the model
+summary(lm_model_train)
+
+# Use the model to make predictions on the test set
+predictions <- predict(lm_model_train, newdata = test)
+
+# Add the predictions to the test dataframe (optional, for convenience)
+test$Predicted_Sales <- predictions
+
+# Perform model diagnostics using check_model()
+check_results <- check_model(lm_model_train)
+
+# Display the results
+print(check_results)
+
+# Calculate RMSE
+rmse_test <- sqrt(mean((test$Total_Sales - test$Predicted_Sales)^2))
+print(paste("RMSE on Test Set:", rmse_test))
+
+# Calculate MAE
+mae_test <- mean(abs(test$Total_Sales - test$Predicted_Sales))
+print(paste("MAE on Test Set:", mae_test))
+
+# Calculate R-squared on Test Set
+ss_total <- sum((test$Total_Sales - mean(test$Total_Sales))^2)
+ss_res <- sum((test$Total_Sales - test$Predicted_Sales)^2)
+r_squared_test <- 1 - (ss_res / ss_total)
+print(paste("R-squared on Test Set:", r_squared_test))
+
+
+# Binned residuals for binomial logistic regression
+result <- binned_residuals(lm_model_train)
+result
+
+# Residuals plot
+if (require("see")) {
+  plot(result, show_dots = TRUE)
+}
+
+# fail to reject the null hypothesis that the residuals are normally distributed.
+check_normality(lm_model_train)
+x <- check_normality(lm_model_train)
+plot(x)
+
+# Plot
+check_predictions(lm_model_train)
+```
+
+## Step 5.2 - Prepare data for Ridge and LASSO Regression
+
+```{r}
+# For the training set
+x_train <- model.matrix(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                          New_Customer_Rate + Reactivated_Rate + Retention_Rate - 1, 
+                        data = train)
+
+y_train <- train$Total_Sales
+
+# For the test set
+x_test <- model.matrix(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                         New_Customer_Rate + Reactivated_Rate + Retention_Rate - 1, 
+                       data = test)
+
+y_test <- test$Total_Sales
+```
+
+## Step 5.3 - Ridge Regression
+
+```{r}
+# Perform cross-validation for Ridge Regression on the training data
+cv_fit_ridge <- cv.glmnet(x_train, y_train, alpha = 0)
+
+# Get the optimal lambda for Ridge from the training data
+lambda_min_ridge <- cv_fit_ridge$lambda.min
+
+# Refit the Ridge Regression model using the optimal lambda on the training data
+model_ridge <- glmnet(x_train, y_train, alpha = 0, lambda = lambda_min_ridge)
+
+# Use the fitted Ridge model to make predictions on the test set
+predictions_ridge <- predict(model_ridge, s = lambda_min_ridge, newx = x_test)
+
+# Calculate RMSE for Ridge Regression on the test data
+rmse_ridge <- sqrt(mean((y_test - predictions_ridge)^2))
+print(paste("Ridge Regression RMSE on Test Set:", rmse_ridge))
+
+# Calculate MAE for Ridge Regression on the test data
+mae_ridge <- mean(abs(y_test - predictions_ridge))
+print(paste("Ridge Regression MAE on Test Set:", mae_ridge))
+
+# Calculate R-squared for Ridge Regression on the test data
+ss_total_ridge <- sum((y_test - mean(y_test))^2)
+ss_res_ridge <- sum((y_test - predictions_ridge)^2)
+r_squared_ridge <- 1 - (ss_res_ridge / ss_total_ridge)
+print(paste("Ridge Regression R-squared on Test Set:", r_squared_ridge))
+```
+
+## Step 5.4 - LASSO Regression
+
+```{r}
+# Perform cross-validation for Lasso Regression on the training data
+cv_fit_lasso <- cv.glmnet(x_train, y_train, alpha = 1)
+
+# Get the optimal lambda for Lasso from the training data
+lambda_min_lasso <- cv_fit_lasso$lambda.min
+
+# Refit the Lasso Regression model using the optimal lambda on the training data
+model_lasso <- glmnet(x_train, y_train, alpha = 1, lambda = lambda_min_lasso)
+
+# Use the fitted Lasso model to make predictions on the test set
+predictions_lasso <- predict(model_lasso, s = lambda_min_lasso, newx = x_test)
+
+# Calculate RMSE for Lasso Regression on the test data
+rmse_lasso <- sqrt(mean((y_test - predictions_lasso)^2))
+print(paste("Lasso Regression RMSE on Test Set:", rmse_lasso))
+
+
+
+# Check Non-zero Coefficients Chosen by Lasso
+# Extract coefficients at the optimal lambda for the Lasso model
+lasso_coefficients <- coef(model_lasso, s = lambda_min_lasso)
+
+# Convert to a more readable format, removing zero coefficients
+non_zero_coefficients <- lasso_coefficients[lasso_coefficients[,1] != 0, , drop = FALSE]
+
+# Print non-zero coefficients
+print("Non-zero Coefficients Chosen by Lasso:")
+print(non_zero_coefficients)
+
+
+# Calculate RMSE for Lasso Regression on the test data
+rmse_lasso <- sqrt(mean((y_test - predictions_lasso)^2))
+print(paste("Lasso Regression RMSE on Test Set:", rmse_lasso))
+
+# Calculate MAE for Lasso Regression on the test data
+mae_lasso <- mean(abs(y_test - predictions_lasso))
+print(paste("Lasso Regression MAE on Test Set:", mae_lasso))
+
+# Calculate R-squared for Lasso Regression on the test data
+ss_total_lasso <- sum((y_test - mean(y_test))^2)
+ss_res_lasso <- sum((y_test - predictions_lasso)^2)
+r_squared_lasso <- 1 - (ss_res_lasso / ss_total_lasso)
+print(paste("Lasso Regression R-squared on Test Set:", r_squared_lasso))
+```
+
+## Step 5.5 - Random Forest
+
+```{r}
+# Fit Random Forest regression model
+rf_model <- randomForest(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                           New_Customer_Rate + Reactivated_Rate + Retention_Rate, 
+                         data = train, importance = TRUE)
+
+# Print the model summary
+print(rf_model)
+
+# Check variable importance
+importance(rf_model)
+
+# Use the fitted model to make predictions on the test set
+predictions_rf <- predict(rf_model, newdata = test)
+
+# Calculate RMSE for Random Forest Regression on the test data
+rmse_rf <- sqrt(mean((test$Total_Sales - predictions_rf)^2))
+print(paste("Random Forest Regression RMSE on Test Set:", rmse_rf))
+
+# Calculate MAE for Random Forest Regression on the test data
+mae_rf <- mean(abs(test$Total_Sales - predictions_rf))
+print(paste("Random Forest Regression MAE on Test Set:", mae_rf))
+
+# Calculate R-squared for Random Forest Regression on the test data
+ss_total_rf <- sum((test$Total_Sales - mean(test$Total_Sales))^2)
+ss_res_rf <- sum((test$Total_Sales - predictions_rf)^2)
+r_squared_rf <- 1 - (ss_res_rf / ss_total_rf)
+print(paste("Random Forest Regression R-squared on Test Set:", r_squared_rf))
+```
+
+## Step 5.6 - Neural Networks
+
+```{r}
+# For capturing complex nonlinear patterns in the data
+# Fit a neural network model
+nn_model <- nnet(Total_Sales ~ Total_Customer + Total_Transactions + ATV + AS + ATF + 
+                 New_Customer_Rate + Reactivated_Rate + Retention_Rate,
+                 data = train,
+                 size = 15,               # Increased number of units in the hidden layer
+                 linout = TRUE,           # Linear output neurons
+                 decay = 0.01,            # Adding weight decay to prevent overfitting
+                 maxit = 500)             # Increased max iterations for more training
+
+
+# Predict on the test set
+predictions_nn <- predict(nn_model, newdata = test, type = "raw")
+
+# Predict on the training set
+train_predictions_nn_complex <- predict(nn_model, newdata = train, type = "raw")
+
+# Calculate RMSE on the training set
+rmse_nn_train_complex <- sqrt(mean((train$Total_Sales - train_predictions_nn_complex)^2))
+print(paste("Neural Network RMSE on Training Set:", rmse_nn_train_complex))
+
+# Calculate RMSE
+rmse_nn <- sqrt(mean((test$Total_Sales - predictions_nn)^2))
+print(paste("Neural Network RMSE on Test Set:", rmse_nn))
+
+# Calculate Mean Absolute Error (MAE) on the test set
+mae_nn_test <- mean(abs(test$Total_Sales - predictions_nn))
+print(paste("Neural Network MAE on Test Set:", mae_nn_test))
+
+# Calculate R-squared for training data
+ss_total_train <- sum((train$Total_Sales - mean(train$Total_Sales))^2)
+ss_res_train <- sum((train$Total_Sales - train_predictions_nn_complex)^2)
+r_squared_train_nn <- 1 - (ss_res_train / ss_total_train)
+print(paste("Neural Network R-squared on Training Set:", r_squared_train_nn))
+
+# Calculate R-squared for test data
+ss_total_test <- sum((test$Total_Sales - mean(test$Total_Sales))^2)
+ss_res_test <- sum((test$Total_Sales - predictions_nn)^2)
+r_squared_test_nn <- 1 - (ss_res_test / ss_total_test)
+print(paste("Neural Network R-squared on Test Set:", r_squared_test_nn))
+
+```
